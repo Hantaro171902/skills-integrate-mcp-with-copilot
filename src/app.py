@@ -5,19 +5,56 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+import secrets
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+security = HTTPBasic()
+
+VALID_USERS = {
+    "teacher@mergington.edu": "teacherpass",
+    "student@mergington.edu": "studentpass",
+}
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+
+def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
+    password = VALID_USERS.get(credentials.username)
+    if not password or not secrets.compare_digest(password, credentials.password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic realm=\"Mergington High School\""},
+        )
+    return credentials.username
+
+
+def require_teacher(username: str = Depends(get_current_user)):
+    if username != "teacher@mergington.edu":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Teacher access required",
+        )
+    return username
+
+
+def ensure_self_or_teacher(username: str, email: str):
+    if username == "teacher@mergington.edu" or username == email:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="You can only manage your own registration or be a teacher",
+    )
 
 # In-memory activity database
 activities = {
@@ -89,8 +126,14 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    username: str = Depends(get_current_user),
+):
     """Sign up a student for an activity"""
+    ensure_self_or_teacher(username, email)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -105,14 +148,26 @@ def signup_for_activity(activity_name: str, email: str):
             detail="Student is already signed up"
         )
 
+    if len(activity["participants"]) >= activity["max_participants"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Activity is full"
+        )
+
     # Add student
     activity["participants"].append(email)
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    username: str = Depends(get_current_user),
+):
     """Unregister a student from an activity"""
+    ensure_self_or_teacher(username, email)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -130,3 +185,8 @@ def unregister_from_activity(activity_name: str, email: str):
     # Remove student
     activity["participants"].remove(email)
     return {"message": f"Unregistered {email} from {activity_name}"}
+
+
+@app.get("/admin/activities")
+def admin_activities(username: str = Depends(require_teacher)):
+    return activities
